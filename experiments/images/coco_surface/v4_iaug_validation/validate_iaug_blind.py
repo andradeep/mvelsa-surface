@@ -61,7 +61,7 @@ if os.path.exists(CALIBRATION_FILE):
             calibration_weights[class_name] = info["avg_reconstruction_error"]
 
 FEATURES_PER_EXPERT = 10
-GLOBAL_FEATURES     = 1   # cy_norm
+GLOBAL_FEATURES     = 5   # cy_norm, aspect_ratio, bbox_area_norm, bbox_w_norm, bbox_h_norm
 n_experts_current   = len(mvelsa.mvelsa)
 
 rep_model    = None
@@ -210,13 +210,17 @@ with torch.no_grad():
         # Estratégia D: MVELSA-REP
         rep_total = n_experts * FEATURES_PER_EXPERT + GLOBAL_FEATURES
         if rep_model is not None and len(rep_profile) == n_experts * FEATURES_PER_EXPERT:
-            rep_profile.append(cy_norm.item())
+            meta = cy_norm  # tensor of 5 features
+            if hasattr(meta, 'tolist'):
+                rep_profile.extend(meta.squeeze().tolist())
+            else:
+                rep_profile.append(float(meta))
             if len(rep_profile) == rep_total:
                 y_pred_rep.append(rep_model.predict([rep_profile])[0])
 
 
 # --- 4. Métricas ---
-V3_REFERENCE = {"B": 0.6430, "C": 0.6940, "D": 0.7789}
+V3_REFERENCE = {"B": 0.6447, "C": 0.7157, "D": 0.8832}
 
 
 def print_report(y_true_f, y_pred_f, title, v3_ref=None):

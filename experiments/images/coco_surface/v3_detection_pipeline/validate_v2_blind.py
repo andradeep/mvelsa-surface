@@ -63,7 +63,7 @@ rep_model = None
 rep_centroids = None
 n_experts_current = len(mvelsa.mvelsa)
 FEATURES_PER_EXPERT = 10
-GLOBAL_FEATURES = 1  # cy_norm
+GLOBAL_FEATURES = 5  # cy_norm, aspect_ratio, bbox_area_norm, bbox_w_norm, bbox_h_norm
 
 if os.path.exists(REP_MODEL_FILE):
     with open(REP_MODEL_FILE, 'rb') as f:
@@ -218,7 +218,11 @@ with torch.no_grad():
         # Estratégia D: MVELSA-REP (+1 feature global: cy_norm)
         rep_total = n_experts * FEATURES_PER_EXPERT + GLOBAL_FEATURES
         if rep_model is not None and len(rep_profile) == n_experts * FEATURES_PER_EXPERT:
-            rep_profile.append(cy_norm.item())
+            meta = cy_norm  # now a tensor of 5 features
+            if hasattr(meta, 'tolist'):
+                rep_profile.extend(meta.squeeze().tolist())
+            else:
+                rep_profile.append(float(meta))
             if len(rep_profile) == rep_total:
                 rep_pred = rep_model.predict([rep_profile])[0]
                 y_pred_rep.append(rep_pred)

@@ -61,6 +61,12 @@ class CroppedDataset(Dataset):
             image = self.transform(image)
 
         if self.return_meta:
-            cy_norm = torch.tensor(float(row.get('cy_norm', 0.5)))
-            return image, label, cy_norm
+            cy_norm        = float(row.get('cy_norm', 0.5))
+            aspect_ratio   = float(row.get('aspect_ratio', 1.0))
+            bbox_area_norm = float(row.get('bbox_area_norm', 0.05))
+            bbox_w_norm    = float(row.get('bbox_w_norm', 0.05))
+            bbox_h_norm    = float(row.get('bbox_h_norm', 0.05))
+            meta = torch.tensor([cy_norm, aspect_ratio, bbox_area_norm, bbox_w_norm, bbox_h_norm],
+                                 dtype=torch.float32)
+            return image, label, meta
         return image, label
