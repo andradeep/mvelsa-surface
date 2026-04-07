@@ -1,141 +1,106 @@
-"""
-Trains MVELSA autoencoders on the cropped surface dataset.
-
-One autoencoder specialist per class. Each specialist is trained on
-its own class data with ae_times passes to reinforce specialization.
-
-Usage:
-    python train_cropped_mvelsa.py
-
-Environment variables:
-    DATA_DIR     — path to coco_cropped directory (default: ../../../../data/coco_cropped)
-    MODEL_DIR    — where to save ELSA_MODEL_CROPPED_SURFACE (default: ./ELSA_MODEL_CROPPED_SURFACE)
-"""
-
-import os
 import sys
+import os
+sys.path.append("../../../../")
+
+from elsanet.mvelsa import MVELSA, RMSELoss
+import torchvision.transforms as transforms
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, ConcatDataset
-from tqdm import tqdm
-from pathlib import Path
+import json
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cropped_data_generator import CroppedSurfaceDataset, BASE_CLASSES, CLASS_TO_IDX
+# Setup parameters
+from data.data_preparation import DataPreparation
+from cropped_data_generator import CroppedDataset, PadToSquare
 
-BASE_DIR  = Path(__file__).resolve().parent
-DATA_DIR  = os.environ.get("DATA_DIR",  str(BASE_DIR / "../../../../data/coco_cropped"))
-MODEL_DIR = os.environ.get("MODEL_DIR", str(BASE_DIR / "ELSA_MODEL_CROPPED_SURFACE"))
+x_resolution = 64
+y_resolution = 64
+channels = 3 # OTIMIZAÇÃO: RGB (12288 neurônios)
+resolution = (x_resolution, y_resolution)
 
-FOCUS_CLASSES = {1, 3, 4, 5, 6}
-LATENT_DIM    = 256
-EPOCHS        = 50
-AE_TIMES      = 2        # passes through own-class data per epoch
-BATCH_SIZE    = 64
-LR            = 1e-3
-DEVICE        = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+transform_train = transforms.Compose([
+    PadToSquare(),                                           # Preserva aspect ratio antes do resize
+    transforms.RandomHorizontalFlip(p=0.5), # Geometric augmentation
+    transforms.ColorJitter(brightness=0.2, contrast=0.2), # Contrast augmentation
+    transforms.ToTensor(),
+    transforms.Resize(size=resolution),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) # Regularização padrão
+])
 
+transform_val = transforms.Compose([
+    PadToSquare(),                                           # Idem
+    transforms.ToTensor(),
+    transforms.Resize(size=resolution),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
 
-class ConvAutoencoder(nn.Module):
-    def __init__(self, latent_dim=256):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 4, 2, 1), nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2, 1), nn.ReLU(),
-            nn.Conv2d(64, 128, 4, 2, 1), nn.ReLU(),
-            nn.Conv2d(128, 256, 4, 2, 1), nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(256 * 8 * 8, latent_dim),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 256 * 8 * 8),
-            nn.Unflatten(1, (256, 8, 8)),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(32, 3, 4, 2, 1), nn.Tanh(),
-        )
+dataset_train = CroppedDataset("../../../../data/coco_cropped", train=True, transform=transform_train)
+dataset_val = CroppedDataset("../../../../data/coco_cropped", train=False, transform=transform_val)
 
-    def forward(self, x):
-        z = self.encoder(x)
-        return self.decoder(z), z
+train_labels = set(dataset_train.targets)
+val_labels = set(dataset_val.targets)
 
-    def encode(self, x):
-        return self.encoder(x)
+# Encontra a interseção para garantir que a rede ELSA possa validar a classe durante o treino
+category_ids = list(train_labels.intersection(val_labels))
 
+# Classes do fullHD633: BOAT(1), BUOY(3), LAND(4), SHIP(5), SKY(6)
+focus_classes = {1, 3, 4, 5, 6}
+category_ids = [c for c in category_ids if c in focus_classes]
+print(f"Categories to train (Filtered to Focus Classes): {category_ids}")
 
-def train_specialist(class_id, class_name, train_dir, model_save_path):
-    print(f"\n=== Training specialist for {class_name} ===")
+# Verificar quantos samples temos por classe (sanity check antes de treinar)
+import collections
+train_counts = collections.Counter(dataset_train.targets)
+val_counts = collections.Counter(dataset_val.targets)
+print("[SANITY CHECK] Amostras de treino por classe (IDs filtrados):")
+for cid in sorted(category_ids):
+    print(f"  Class {cid}: train={train_counts.get(cid,0)}, val={val_counts.get(cid,0)}")
 
-    ds_own = CroppedSurfaceDataset(train_dir, focus_classes=FOCUS_CLASSES,
-                                    single_class=class_id)
-    # Repeat own-class data ae_times
-    ds_train = ConcatDataset([ds_own] * AE_TIMES)
+data_parameters = {
+    "data_type": "image",
+    "file_path": "../../../../data/coco_cropped/",
+    "dataset_name": CroppedDataset,
+    "transform": transform_val, # Use val transforms for standard loading testing fallback
+    "batch_size": 64,          
+    "data_train_lenght": None,  # Use all data
+    "data_val_lenght": 50,      # Number of samples for validation
+}
 
-    loader = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True,
-                        num_workers=4, pin_memory=True)
+data_instance = DataPreparation(data_parameters).gen()
+# Injecting our heavily augmented dataset instances manually to preserve the hooks
+data_instance.train = dataset_train
+data_instance.test = dataset_val
 
-    model = ConvAutoencoder(latent_dim=LATENT_DIM).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.MSELoss()
+# Ensure we only use labels that have both train and test samples.
+data_instance.get_labels(category_ids)
 
-    loss_history = []
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        epoch_loss = 0.0
-        for batch in loader:
-            imgs, _ = batch[0], batch[1]
-            imgs = imgs.to(DEVICE)
-            recon, _ = model(imgs)
-            loss = criterion(recon, imgs)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * imgs.size(0)
+# OTIMIZAÇÃO 3: AE Profundo (Múltiplas Camadas para 3 Canais RGB de Entrada)
+# 64 * 64 * 3 (RGB) = 12288 Neurônios na Base Linear (O antigo dava erro numérico porque era *1)
+initial_ae_layer = x_resolution * y_resolution * channels
 
-        avg_loss = epoch_loss / len(ds_train)
-        loss_history.append(avg_loss)
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"  Epoch {epoch:3d}/{EPOCHS}  loss={avg_loss:.6f}")
+# Descobrir dispositivo (GPU para treinar mais rápido)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Treinando specialistas em: {device}")
 
-    os.makedirs(model_save_path, exist_ok=True)
-    torch.save(model.state_dict(),
-               os.path.join(model_save_path, f"ae_{class_name}.pth"))
-    print(f"  Saved: ae_{class_name}.pth")
-    return loss_history
+model_hyperparameters = {
+    "ae_architecture": [
+        initial_ae_layer,
+        1024,   # Compressão 1
+        256,    # Compressão 2
+        128,    # Latent space final robusto (128)
+    ],
+    "ae_times": 2,
+    "activation": "ReLU",
+    "epochs": 100, # Aumentado de 35 para 100 para maior poder de discriminação
+    "learning_rate": 0.001, # LR levemente menor para convergência mais fina
+    "loss_function": RMSELoss().to(device),
+    "seed": 42,
+    "device": device, # CRÍTICO: garante que especialistas usem GPU
+}
 
+mvelsa = MVELSA(model_hyperparameters)
 
-def main():
-    print(f"Device: {DEVICE}")
-    print(f"Data:   {DATA_DIR}")
-    print(f"Models: {MODEL_DIR}")
+print("INICIANDO TREINAMENTO MVELSA (CROPPED DATASET)")
+mvelsa.fit(data_instance)
+print("TREINAMENTO FINALIZADO")
 
-    train_dir = os.path.join(DATA_DIR, 'train')
-
-    all_losses = {}
-    for cls_id in sorted(FOCUS_CLASSES):
-        cls_name = BASE_CLASSES[cls_id]
-        losses = train_specialist(cls_id, cls_name, train_dir, MODEL_DIR)
-        all_losses[cls_name] = losses
-
-    # Save loss plot
-    try:
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 6))
-        for name, losses in all_losses.items():
-            plt.plot(losses, label=name)
-        plt.xlabel('Epoch')
-        plt.ylabel('MSE Loss')
-        plt.title('MVELSA Autoencoder Training Loss')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(BASE_DIR, 'Cropped_Loss_Graph.png'))
-        print("\nLoss graph saved.")
-    except ImportError:
-        pass
-
-    print("\nTraining complete!")
-
-
-if __name__ == '__main__':
-    main()
+mvelsa.save(file_name="ELSA_MODEL_CROPPED_SURFACE")
+print("Modelo salvo como ELSA_MODEL_CROPPED_SURFACE")

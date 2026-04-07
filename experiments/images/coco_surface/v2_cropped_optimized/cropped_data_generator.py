@@ -1,98 +1,66 @@
-"""
-Dataset generator for MVELSA cropped surface experiment.
-Reads images and labels from a directory with labels.csv.
-"""
-
 import os
-import pandas as pd
-from PIL import Image
 import torch
+import pandas as pd
 from torch.utils.data import Dataset
-from torchvision import transforms
-
-BASE_CLASSES = {
-    1: 'BOAT',
-    3: 'BUOY',
-    4: 'LAND',
-    5: 'SHIP',
-    6: 'SKY',
-}
-
-CLASS_TO_IDX = {cls_id: idx for idx, cls_id in enumerate(sorted(BASE_CLASSES.keys()))}
-IDX_TO_CLASS = {idx: BASE_CLASSES[cls_id] for cls_id, idx in CLASS_TO_IDX.items()}
-
-DEFAULT_TRANSFORM = transforms.Compose([
-    transforms.Resize((128, 128)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-])
+from PIL import Image
 
 
-class CroppedSurfaceDataset(Dataset):
-    """
-    Dataset of cropped surface objects for MVELSA training.
+class PadToSquare:
+    """Pad a PIL image to a square with black borders (preserves aspect ratio before resize)."""
+    def __call__(self, img):
+        w, h = img.size
+        max_side = max(w, h)
+        # center the image on a black square canvas
+        padded = Image.new(img.mode, (max_side, max_side), 0)
+        padded.paste(img, ((max_side - w) // 2, (max_side - h) // 2))
+        return padded
 
-    Args:
-        data_dir: Directory containing images and labels.csv
-        transform: Optional torchvision transform
-        return_meta: If True, returns (image, label, meta_tensor) where
-                     meta_tensor is [cy_norm, aspect_ratio, bbox_area_norm,
-                                     bbox_w_norm, bbox_h_norm]
-        focus_classes: Set of class_ids to include (default: all BASE_CLASSES)
-        single_class: If set, only load images of this class_id
-    """
 
-    def __init__(self, data_dir, transform=None, return_meta=False,
-                 focus_classes=None, single_class=None):
-        self.data_dir = data_dir
-        self.transform = transform or DEFAULT_TRANSFORM
+# Classes do fullHD633: BOAT(1), BUOY(3), LAND(4), SHIP(5), SKY(6)
+FOCUS_CLASSES = {1, 3, 4, 5, 6}
+
+import warnings
+
+warnings.filterwarnings("ignore")
+
+class CroppedDataset(Dataset):
+    """Simple CSV-based dataset loader for the cropped COCO instances."""
+
+    def __init__(self, root, train=True, transform=None, return_meta=False):
+        self.root_dir = root
+        self.folder = "train" if train else "valid"
         self.return_meta = return_meta
 
-        if focus_classes is None:
-            focus_classes = set(BASE_CLASSES.keys())
-        self.focus_classes = focus_classes
+        self.csv_path = os.path.join(self.root_dir, self.folder, "labels.csv")
 
-        csv_path = os.path.join(data_dir, 'labels.csv')
-        df = pd.read_csv(csv_path)
+        if os.path.exists(self.csv_path):
+            self.data_info = pd.read_csv(self.csv_path)
+            self.targets = self.data_info['class_id'].tolist()
+        else:
+            print(f"File not found: {self.csv_path}")
+            self.data_info = pd.DataFrame(columns=['filename', 'class_id'])
+            self.targets = []
 
-        # Filter to focus classes
-        df = df[df['class_id'].isin(focus_classes)].reset_index(drop=True)
-
-        # Filter to single class if requested
-        if single_class is not None:
-            df = df[df['class_id'] == single_class].reset_index(drop=True)
-
-        # Keep only files that exist on disk
-        df = df[df['filename'].apply(
-            lambda f: os.path.exists(os.path.join(data_dir, f))
-        )].reset_index(drop=True)
-
-        self.df = df
+        self.transform = transform
 
     def __len__(self):
-        return len(self.df)
+        return len(self.data_info)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img_path = os.path.join(self.data_dir, row['filename'])
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        row = self.data_info.iloc[idx]
+        img_path = os.path.join(self.root_dir, self.folder, row['filename'])
+
+        # OTIMIZAÇÃO DE TESE 1: Preservar características RGB vitais
         image = Image.open(img_path).convert('RGB')
+        label = torch.tensor(int(row['class_id']))
 
         if self.transform:
             image = self.transform(image)
 
-        # Map class_id to sequential index
-        label = CLASS_TO_IDX[row['class_id']]
-
         if self.return_meta:
-            cy_norm        = float(row.get('cy_norm', 0.5))
-            aspect_ratio   = float(row.get('aspect_ratio', 1.0))
-            bbox_area_norm = float(row.get('bbox_area_norm', 0.05))
-            bbox_w_norm    = float(row.get('bbox_w_norm', 0.05))
-            bbox_h_norm    = float(row.get('bbox_h_norm', 0.05))
-            meta = torch.tensor(
-                [cy_norm, aspect_ratio, bbox_area_norm, bbox_w_norm, bbox_h_norm],
-                dtype=torch.float32
-            )
-            return image, label, meta
-
+            cy_norm = torch.tensor(float(row.get('cy_norm', 0.5)))
+            return image, label, cy_norm
         return image, label

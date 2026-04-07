@@ -1,115 +1,111 @@
 """
-Trains MVELSA specialists on the combined FHD+IAUG dataset.
+MVELSA V4 — Treinamento de Especialistas (dataset IAUG)
+========================================================
+Treino: dataset IAUG augmentado (coco_cropped_iaug/train/)
+Validação: dataset fullHD633 val (coco_cropped/valid/)  ← MESMA base da V3
 
-Same architecture as V3, but training data includes augmented samples.
-Specialists for LAND and SHIP are trained only on FHD data (IAUG excluded
-those classes due to domain shift degradation).
-
-Usage:
-    python train_mvelsa_iaug.py
-
-Environment variables:
-    COMBINED_DATA_PATH — path to coco_cropped_combined (train split)
-    FHD_DATA_PATH      — path to coco_cropped (for LAND/SHIP specialists)
-    MODEL_DIR          — where to save ELSA_MODEL_IAUG (default: ./ELSA_MODEL_IAUG)
-    AE_TIMES           — autoencoder training passes (default: 2)
+Comparação direta com V3: diferença isolada é APENAS o dataset de treino.
 """
-
-import os
 import sys
+import os
+sys.path.append("../../../../")
+sys.path.append("../v2_cropped_optimized")
+
+from elsanet.mvelsa import MVELSA, RMSELoss
+import torchvision.transforms as transforms
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, ConcatDataset
-from tqdm import tqdm
-from pathlib import Path
+import json
+import collections
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "v2_cropped_optimized"))
-from cropped_data_generator import CroppedSurfaceDataset, BASE_CLASSES, CLASS_TO_IDX
-from train_cropped_mvelsa import ConvAutoencoder, LATENT_DIM
+from data.data_preparation import DataPreparation
+from cropped_data_generator import CroppedDataset, PadToSquare
 
-BASE_DIR      = Path(__file__).resolve().parent
-COMBINED_DATA = os.environ.get("COMBINED_DATA_PATH", str(BASE_DIR / "../../../../data/coco_cropped_combined"))
-FHD_DATA      = os.environ.get("FHD_DATA_PATH",      str(BASE_DIR / "../../../../data/coco_cropped"))
-MODEL_DIR     = os.environ.get("MODEL_DIR",           str(BASE_DIR / "ELSA_MODEL_IAUG"))
-AE_TIMES      = int(os.environ.get("AE_TIMES", "2"))
+x_resolution = 64
+y_resolution  = 64
+channels      = 3
+resolution    = (x_resolution, y_resolution)
 
-FOCUS_CLASSES = {1, 3, 4, 5, 6}
-# Classes trained only on FHD data (IAUG domain shift degrades these)
-FHD_ONLY_CLASSES = {4, 6}  # LAND, SHIP
+transform_train = transforms.Compose([
+    PadToSquare(),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor(),
+    transforms.Resize(size=resolution),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
 
-EPOCHS     = 50
-BATCH_SIZE = 64
-LR         = 1e-3
-DEVICE     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+transform_val = transforms.Compose([
+    PadToSquare(),
+    transforms.ToTensor(),
+    transforms.Resize(size=resolution),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
 
+# Treino: fullHD633 + IAUG combinados | Validação: fullHD633 puro
+COMBINED_DATA = os.environ.get("COMBINED_DATA_PATH", "../../../../data/coco_cropped_combined")
+FHD_DATA      = os.environ.get("FHD_DATA_PATH",      "../../../../data/coco_cropped")
 
-def train_specialist(class_id, class_name, train_dir, model_save_dir):
-    print(f"\n=== Training specialist: {class_name} ===")
+dataset_train = CroppedDataset(COMBINED_DATA, train=True,  transform=transform_train)
+dataset_val   = CroppedDataset(FHD_DATA,  train=False, transform=transform_val)
 
-    ds_own = CroppedSurfaceDataset(train_dir, focus_classes=FOCUS_CLASSES,
-                                    single_class=class_id)
-    ds_train = ConcatDataset([ds_own] * AE_TIMES)
-    loader = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True,
-                        num_workers=4, pin_memory=True)
+train_labels = set(dataset_train.targets)
+val_labels   = set(dataset_val.targets)
 
-    print(f"  Samples: {len(ds_own)} × {AE_TIMES} = {len(ds_train)}")
+focus_classes = {1, 3, 4, 5, 6}  # BOAT, BUOY, LAND, SHIP, SKY (IDs fullHD633/saída)
+category_ids  = [c for c in train_labels.intersection(val_labels) if c in focus_classes]
+print(f"Classes comuns treino∩val (filtradas): {category_ids}")
 
-    model = ConvAutoencoder(latent_dim=LATENT_DIM).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.MSELoss()
+# Sanity check
+train_counts = collections.Counter(dataset_train.targets)
+val_counts   = collections.Counter(dataset_val.targets)
+print("\n[SANITY CHECK] Amostras por classe:")
+base_classes = {1: 'BOAT', 3: 'BUOY', 4: 'LAND', 5: 'SHIP', 6: 'SKY'}
+for cid in sorted(category_ids):
+    print(f"  {base_classes.get(cid, cid):6s} (id {cid}): "
+          f"train(IAUG)={train_counts.get(cid, 0)}, val(fullHD633)={val_counts.get(cid, 0)}")
 
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        epoch_loss = 0.0
-        for batch in loader:
-            imgs = batch[0].to(DEVICE)
-            recon, _ = model(imgs)
-            loss = criterion(recon, imgs)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * imgs.size(0)
+data_parameters = {
+    "data_type":         "image",
+    "file_path":         FHD_DATA + "/",   # usa fullHD633 para que gen() encontre valid/
+    "dataset_name":      CroppedDataset,
+    "transform":         transform_val,
+    "batch_size":        64,
+    "data_train_lenght": None,
+    "data_val_lenght":   50,
+}
 
-        avg_loss = epoch_loss / len(ds_train)
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"  Epoch {epoch:3d}/{EPOCHS}  loss={avg_loss:.6f}")
+data_instance = DataPreparation(data_parameters).gen()
+data_instance.train = dataset_train  # fullHD633 + IAUG combinados
+data_instance.test  = dataset_val    # fullHD633 val
+data_instance.get_labels(category_ids)
 
-    os.makedirs(model_save_dir, exist_ok=True)
-    save_path = os.path.join(model_save_dir, f"ae_{class_name}.pth")
-    torch.save(model.state_dict(), save_path)
-    print(f"  Saved: {save_path}")
-    return model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"\nDispositivo: {device}")
 
+initial_ae_layer = x_resolution * y_resolution * channels  # 12288
 
-def main():
-    print(f"Device:        {DEVICE}")
-    print(f"Combined data: {COMBINED_DATA}")
-    print(f"FHD data:      {FHD_DATA}")
-    print(f"Model dir:     {MODEL_DIR}")
-    print(f"AE times:      {AE_TIMES}")
+model_hyperparameters = {
+    "ae_architecture": [
+        initial_ae_layer,
+        1024,
+        256,
+        128,
+    ],
+    "ae_times":      int(os.environ.get("AE_TIMES", "2")),  # Colab: exportar AE_TIMES=3
+    "activation":    "ReLU",
+    "epochs":        100,
+    "learning_rate": 0.001,
+    "loss_function": RMSELoss().to(device),
+    "seed":          42,
+    "device":        device,
+}
 
-    all_losses = {}
-    for cls_id in sorted(FOCUS_CLASSES):
-        cls_name = BASE_CLASSES[cls_id]
+mvelsa = MVELSA(model_hyperparameters)
 
-        # LAND and SHIP: use FHD only
-        if cls_id in FHD_ONLY_CLASSES:
-            train_dir = os.path.join(FHD_DATA, 'train')
-            print(f"\n  {cls_name}: using FHD-only data (domain shift issue)")
-        else:
-            train_dir = os.path.join(COMBINED_DATA, 'train')
+print("\nINICIANDO TREINAMENTO MVELSA V4 (IAUG)")
+mvelsa.fit(data_instance)
+print("TREINAMENTO FINALIZADO")
 
-        train_specialist(cls_id, cls_name, train_dir, MODEL_DIR)
-
-    print("\nTraining complete!")
-
-    # Save loss graph if matplotlib available
-    try:
-        import matplotlib.pyplot as plt
-        # (losses not collected in this simplified version — skip graph)
-    except ImportError:
-        pass
-
-
-if __name__ == '__main__':
-    main()
+mvelsa.save(file_name="ELSA_MODEL_IAUG")
+print("Modelo salvo como ELSA_MODEL_IAUG")
+print("Próximo passo: python gen_encoded_iaug.py")

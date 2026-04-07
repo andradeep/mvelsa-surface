@@ -1,113 +1,85 @@
 """
-Calibrates IAUG-trained MVELSA specialists on the FHD validation split.
-
-Output:
-    expert_calibration_iaug.json
-
-Usage:
-    python calibrate_experts_iaug.py
-
-Environment variables:
-    FHD_DATA_PATH — coco_cropped directory
-    MODEL_DIR     — ELSA_MODEL_IAUG directory
-    OUT_DIR       — where to save JSON (default: ./)
+MVELSA V4 — Calibração dos Especialistas (IAUG)
+================================================
+Mede o erro de reconstrução baseline de cada especialista em sua própria classe.
+Usa o split de validação fullHD633 (mesma base da V3) para calibração comparável.
 """
-
-import os
 import sys
+import os
 import json
-import statistics
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from pathlib import Path
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Subset
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "v2_cropped_optimized"))
-from cropped_data_generator import CroppedSurfaceDataset, BASE_CLASSES, CLASS_TO_IDX
-from train_cropped_mvelsa import ConvAutoencoder, LATENT_DIM
+sys.path.append("../../../../")
+sys.path.append("../v2_cropped_optimized")
 
-BASE_DIR  = Path(__file__).resolve().parent
-FHD_DATA  = os.environ.get("FHD_DATA_PATH", str(BASE_DIR / "../../../../data/coco_cropped"))
-MODEL_DIR = os.environ.get("MODEL_DIR",     str(BASE_DIR / "ELSA_MODEL_IAUG"))
-OUT_DIR   = os.environ.get("OUT_DIR",       str(BASE_DIR))
+from elsanet.mvelsa import MVELSA, RMSELoss
+from elsanet.elsa import ELSA
+from cropped_data_generator import CroppedDataset, PadToSquare
 
-FOCUS_CLASSES = {1, 3, 4, 5, 6}
-DEVICE        = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-BATCH_SIZE    = 128
-CRITERION     = nn.MSELoss(reduction='none')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ELSA_PATH        = "ELSA_MODEL_IAUG"
+CALIBRATION_FILE = "expert_calibration_iaug.json"
 
+transform_val = transforms.Compose([
+    PadToSquare(),
+    transforms.ToTensor(),
+    transforms.Resize(size=(64, 64)),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
 
-def load_specialists():
-    specialists = {}
-    for cls_id in sorted(FOCUS_CLASSES):
-        cls_name = BASE_CLASSES[cls_id]
-        model = ConvAutoencoder(latent_dim=LATENT_DIM).to(DEVICE)
-        ckpt = os.path.join(MODEL_DIR, f"ae_{cls_name}.pth")
-        model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
-        model.eval()
-        specialists[cls_id] = (cls_name, model)
-    return specialists
+print(f"Carregando modelo: {ELSA_PATH}...")
+mvelsa = torch.load(ELSA_PATH, map_location=device, weights_only=False)
+mvelsa.to(device)
+mvelsa.eval()
 
+# Calibra no fullHD633 val (mesma base da V3 — garante comparabilidade)
+print("Carregando dataset de calibração: fullHD633 val...")
+_fhd_path = os.environ.get("FHD_DATA_PATH", "../../../../data/coco_cropped")
+dataset_val = CroppedDataset(_fhd_path, train=False, transform=transform_val)
 
-def compute_errors_on_val(specialist_model, fhd_data_path):
-    ds = CroppedSurfaceDataset(os.path.join(fhd_data_path, 'valid'),
-                                focus_classes=FOCUS_CLASSES)
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False,
-                        num_workers=4, pin_memory=True)
+base_classes = {1: 'BOAT', 3: 'BUOY', 4: 'LAND', 5: 'SHIP', 6: 'SKY'}
+calibration_data = {}
 
-    errors_by_class = {cls_id: [] for cls_id in FOCUS_CLASSES}
-    idx_to_cls = {v: k for k, v in CLASS_TO_IDX.items()}
+print("\nCalibrando especialistas...")
+for idx, label in enumerate(mvelsa.labels):
+    class_name = base_classes.get(label, f"Class_{label}")
+    indices = [i for i, t in enumerate(dataset_val.targets) if t == label]
 
-    specialist_model.eval()
+    if len(indices) == 0:
+        print(f"  [{class_name}] AVISO: nenhuma amostra no val. Usando erro padrão=0.1")
+        calibration_data[class_name] = {"label_id": int(label), "avg_reconstruction_error": 0.1, "weight": 1.0}
+        continue
+
+    indices = indices[:100]
+    val_subset = Subset(dataset_val, indices)
+    val_loader = DataLoader(val_subset, batch_size=32, shuffle=False)
+
+    elsa_expert = mvelsa.mvelsa[idx]
+    total_error, total_samples = 0.0, 0
+
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Errors", leave=False):
-            imgs, labels = batch[0], batch[1]
-            imgs = imgs.to(DEVICE)
-            recon, _ = specialist_model(imgs)
-            err = CRITERION(recon, imgs).mean(dim=[1, 2, 3]).cpu()
-            for i, lbl in enumerate(labels):
-                cls_id = idx_to_cls[lbl.item()]
-                errors_by_class[cls_id].append(err[i].item())
+        for batch in val_loader:
+            inputs, _ = batch
+            inputs = inputs.to(device)
+            input_flat = inputs.view(inputs.shape[0], 1, -1).to(dtype=torch.float)
+            _, dec_avg = elsa_expert.image_forward(input_flat)
+            mse = F.mse_loss(dec_avg, input_flat, reduction='mean').item()
+            total_error  += mse * inputs.shape[0]
+            total_samples += inputs.shape[0]
 
-    return errors_by_class
+    avg_error = total_error / total_samples if total_samples > 0 else 0.1
+    calibration_data[class_name] = {
+        "label_id":                int(label),
+        "avg_reconstruction_error": float(avg_error),
+        "weight":                   float(1.0 / (avg_error + 1e-6))
+    }
+    print(f"  [{class_name}] Erro médio: {avg_error:.6f} ({total_samples} amostras)")
 
+with open(CALIBRATION_FILE, "w") as f:
+    json.dump(calibration_data, f, indent=4)
 
-def main():
-    print(f"Device: {DEVICE}")
-    specialists = load_specialists()
-    calibration = {}
-
-    for spec_cls_id, (spec_name, model) in specialists.items():
-        print(f"\nCalibrating: {spec_name}")
-        errors = compute_errors_on_val(model, FHD_DATA)
-
-        in_errors  = errors[spec_cls_id]
-        out_errors = [e for cid, errs in errors.items() if cid != spec_cls_id for e in errs]
-
-        in_mean  = statistics.mean(in_errors)  if in_errors  else 0.0
-        out_mean = statistics.mean(out_errors) if out_errors else 0.0
-        threshold = (in_mean + out_mean) / 2.0
-
-        print(f"  In-class:     {in_mean:.6f}")
-        print(f"  Out-of-class: {out_mean:.6f}")
-        print(f"  Threshold:    {threshold:.6f}")
-
-        calibration[spec_name] = {
-            'class_id':  spec_cls_id,
-            'in_mean':   in_mean,
-            'out_mean':  out_mean,
-            'threshold': threshold,
-            'n_in':      len(in_errors),
-            'n_out':     len(out_errors),
-        }
-
-    out_path = os.path.join(OUT_DIR, 'expert_calibration_iaug.json')
-    with open(out_path, 'w') as f:
-        json.dump(calibration, f, indent=2)
-
-    print(f"\nSaved: {out_path}")
-
-
-if __name__ == '__main__':
-    main()
+print(f"\n✅ Calibração salva em: {CALIBRATION_FILE}")
+print("Próximo passo: python extract_rep_profiles_iaug.py")

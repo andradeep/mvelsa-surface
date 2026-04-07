@@ -1,102 +1,75 @@
 """
-Generates MVELSA encoded features for the combined FHD+IAUG dataset.
-
-Uses the IAUG-trained specialists to encode all images.
-For validation/test, uses FHD data only (IAUG was training only).
-
-Output:
-    ENCODED_DATA_IAUG/
-        train_encoded.pt
-        valid_encoded.pt
-        test_encoded.pt
-
-Usage:
-    python gen_encoded_iaug.py
-
-Environment variables:
-    COMBINED_DATA_PATH — path to coco_cropped_combined
-    FHD_DATA_PATH      — path to coco_cropped (for valid/test)
-    MODEL_DIR          — ELSA_MODEL_IAUG directory
-    ENCODED_DIR        — output directory (ENCODED_DATA_IAUG)
+MVELSA V4 — Geração de Representações Latentes (IAUG)
+=====================================================
+Passa o dataset IAUG train pelo modelo treinado e gera os vetores latentes.
+Usa fullHD633 val para validação (consistência com V3).
 """
-
-import os
 import sys
+import os
+sys.path.append("../../../../")
+sys.path.append("../v2_cropped_optimized")
+
 import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from pathlib import Path
+import torchvision.transforms as transforms
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "v2_cropped_optimized"))
-from cropped_data_generator import CroppedSurfaceDataset, BASE_CLASSES
-from train_cropped_mvelsa import ConvAutoencoder, LATENT_DIM
+from data.data_preparation import DataPreparation
+from elsanet.mvelsa import MVELSA, RMSELoss
+from elsanet.elsa import ELSA
+from cropped_data_generator import CroppedDataset, PadToSquare
 
-BASE_DIR      = Path(__file__).resolve().parent
-COMBINED_DATA = os.environ.get("COMBINED_DATA_PATH", str(BASE_DIR / "../../../../data/coco_cropped_combined"))
-FHD_DATA      = os.environ.get("FHD_DATA_PATH",      str(BASE_DIR / "../../../../data/coco_cropped"))
-MODEL_DIR     = os.environ.get("MODEL_DIR",           str(BASE_DIR / "ELSA_MODEL_IAUG"))
-ENCODED_DIR   = os.environ.get("ENCODED_DIR",         str(BASE_DIR / "ENCODED_DATA_IAUG"))
+x_resolution = 64
+y_resolution  = 64
+channels      = 3
+resolution    = (x_resolution, y_resolution)
 
-FOCUS_CLASSES = {1, 3, 4, 5, 6}
-DEVICE        = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-BATCH_SIZE    = 128
+transform = transforms.Compose([
+    PadToSquare(),
+    transforms.ToTensor(),
+    transforms.Resize(size=resolution),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
 
+COMBINED_DATA = os.environ.get("COMBINED_DATA_PATH", "../../../../data/coco_cropped_combined")
+FHD_DATA      = os.environ.get("FHD_DATA_PATH",      "../../../../data/coco_cropped")
 
-def load_specialists():
-    specialists = {}
-    for cls_id in sorted(FOCUS_CLASSES):
-        cls_name = BASE_CLASSES[cls_id]
-        model = ConvAutoencoder(latent_dim=LATENT_DIM).to(DEVICE)
-        ckpt = os.path.join(MODEL_DIR, f"ae_{cls_name}.pth")
-        model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
-        model.eval()
-        specialists[cls_name] = model
-    return specialists
+dataset_train = CroppedDataset(COMBINED_DATA, train=True,  transform=transform)
+dataset_val   = CroppedDataset(FHD_DATA,      train=False, transform=transform)
 
+train_labels = set(dataset_train.targets)
+val_labels   = set(dataset_val.targets)
 
-def encode_split(split, data_dir, specialists):
-    ds = CroppedSurfaceDataset(os.path.join(data_dir, split),
-                                focus_classes=FOCUS_CLASSES)
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False,
-                        num_workers=4, pin_memory=True)
+focus_classes = {1, 3, 4, 5, 6}
+category_ids  = [c for c in train_labels.intersection(val_labels) if c in focus_classes]
+print(f"Classes para encoding: {category_ids}")
 
-    all_features, all_labels = [], []
-    with torch.no_grad():
-        for batch in tqdm(loader, desc=f"Encoding {split}"):
-            imgs, labels = batch[0], batch[1]
-            imgs = imgs.to(DEVICE)
-            latents = []
-            for cls_name in sorted(specialists.keys()):
-                z = specialists[cls_name].encode(imgs)
-                latents.append(z.cpu())
-            concat = torch.cat(latents, dim=1)
-            all_features.append(concat)
-            all_labels.append(labels)
+data_parameters = {
+    "data_type":         "image",
+    "file_path":         FHD_DATA + "/",   # usa fullHD633 para que gen() encontre valid/
+    # train será substituído pelo combined logo abaixo
+    "dataset_name":      CroppedDataset,
+    "transform":         transform,
+    "batch_size":        128,
+    "data_train_lenght": None,
+    "data_val_lenght":   50,
+}
 
-    features = torch.cat(all_features, dim=0)
-    labels   = torch.cat(all_labels,   dim=0)
-    print(f"  {split}: {features.shape[0]} samples, {features.shape[1]}D")
-    return {'features': features, 'labels': labels}
+data_instance = DataPreparation(data_parameters).gen()
+data_instance.train = dataset_train  # substitui pelo IAUG train
+data_instance.test  = dataset_val    # fullHD633 val
+data_instance.get_labels(category_ids)
 
+model_file = "ELSA_MODEL_IAUG"
+print(f"Carregando modelo: {model_file}...")
+try:
+    with torch.serialization.safe_globals([MVELSA, ELSA, RMSELoss]):
+        mvelsa = torch.load(model_file, weights_only=False)
+except AttributeError:
+    mvelsa = torch.load(model_file)
 
-def main():
-    print(f"Device: {DEVICE}")
-    os.makedirs(ENCODED_DIR, exist_ok=True)
+print("Gerando representações latentes (IAUG train + fullHD633 val)...")
+data_instance.mvelsa = mvelsa
+data_instance.gen_encoded_data()
 
-    print("Loading IAUG specialists...")
-    specialists = load_specialists()
-
-    # Train: combined data
-    data = encode_split('train', COMBINED_DATA, specialists)
-    torch.save(data, os.path.join(ENCODED_DIR, 'train_encoded.pt'))
-
-    # Valid / Test: FHD only
-    for split in ('valid', 'test'):
-        data = encode_split(split, FHD_DATA, specialists)
-        torch.save(data, os.path.join(ENCODED_DIR, f"{split}_encoded.pt"))
-
-    print(f"\nEncoded data saved to: {ENCODED_DIR}")
-
-
-if __name__ == '__main__':
-    main()
+data_instance.save(file_name="ENCODED_DATA_IAUG")
+print("Salvo como ENCODED_DATA_IAUG")
+print("Próximo passo: python train_classifier_iaug.py")

@@ -1,139 +1,181 @@
-"""
-Trains an MLP classifier on top of the MVELSA 1280D encoded features.
-
-Strategy B: MLP on concatenated latent space.
-
-Usage:
-    python train_cropped_classifier.py
-
-Environment variables:
-    ENCODED_DIR  — ENCODED_DATA_CROPPED_SURFACE directory
-    MODEL_DIR    — where to save MVELSA_CLASSIFIER.pth (default: ./)
-"""
-
-import os
 import sys
+import os
+sys.path.append("../../../../")
+
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
-from tqdm import tqdm
-from pathlib import Path
+from sklearn.metrics import accuracy_score, recall_score, precision_score
+import matplotlib.pyplot as plt
 
-BASE_DIR     = Path(__file__).resolve().parent
-ENCODED_DIR  = os.environ.get("ENCODED_DIR",  str(BASE_DIR / "ENCODED_DATA_CROPPED_SURFACE"))
-MODEL_DIR    = os.environ.get("MODEL_DIR",    str(BASE_DIR))
+from data.data_preparation import DataPreparation
+from elsanet.classifier import MultiVariableClassifier
 
-NUM_CLASSES  = 5
-LATENT_DIM   = 256
-INPUT_DIM    = NUM_CLASSES * LATENT_DIM  # 1280
-HIDDEN_DIM   = 512
-EPOCHS       = 100
-BATCH_SIZE   = 64
-LR           = 1e-3
-DEVICE       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Load previously encoded variables
+import torch
+import numpy as np
+from sklearn.utils.class_weight import compute_class_weight
+data_instance = torch.load("ENCODED_DATA_CROPPED_SURFACE", weights_only=False)
 
-BASE_CLASSES = {
-    1: 'BOAT',
-    3: 'BUOY',
-    4: 'LAND',
-    5: 'SHIP',
-    6: 'SKY',
+# Descobrir dispositivo (CUDA ou CPU)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Dimensão latente descoberta
+inputs, targets = data_instance.data_train.dataset.tensors
+input_feat_size = inputs.shape[-1]
+print(f"Dimensão latente descoberta: {input_feat_size}")
+
+# OTIMIZAÇÃO DE TESE 4: Class Weights (Suavizados para evitar explosão)
+y_train = targets.numpy()
+classes_unique = np.unique(y_train)
+class_weights = compute_class_weight(class_weight='balanced', classes=classes_unique, y=y_train)
+
+# CAP nos pesos: Se uma classe for rara demais (ex: SHIP), não deixamos o peso passar de 3.0
+# Isso evita que o modelo "chute" SHIP em tudo para baixar o loss.
+class_weights = np.clip(class_weights, 0.5, 3.0) 
+
+class_weights_tensor = torch.tensor(class_weights, dtype=torch.float).to(device)
+print(f"Pesos de classe suavizados (Capped at 3.0): {class_weights_tensor}")
+
+model_parameters = {
+    "input_size": input_feat_size,
+    "n_classes": len(data_instance.labels_list),
+    "learning_rate": 0.001,
+    "epochs": 100,
+    "loss_function": nn.NLLLoss(weight=class_weights_tensor), # Pesos movidos para o device correto
+    "seed": 42,
 }
 
+print(f"Número de classes identificadas no dataset latente: {model_parameters['n_classes']}")
 
-class MLPClassifier(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_classes):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim // 2, num_classes),
-        )
+classifier = MultiVariableClassifier(model_parameters)
 
-    def forward(self, x):
-        return self.net(x)
+print("INICIANDO TREINAMENTO DO CLASSIFICADOR (CROPPED DATASET)")
+classifier.fit(data_instance)
 
+# Plots
+classifier_loss_fig = plt.figure()
+plt.plot(classifier.loss_train, label="Train Loss")
+plt.plot(classifier.loss_val, label="Validation Loss", linestyle="--")
+plt.title(f"Classifier Loss (Cropped) - Time: {classifier.elapsed_time:.2f}s")
+plt.xlabel("Steps")
+plt.ylabel("NLL Loss")
+plt.legend()
+classifier_loss_fig.savefig("Cropped_Loss_Graph.png")
+print("Saved Cropped_Loss_Graph.png")
 
-def load_split(split):
-    path = os.path.join(ENCODED_DIR, f"{split}_encoded.pt")
-    data = torch.load(path, map_location='cpu')
-    return data['features'], data['labels']
+# Predict over the COMPLETE test set
+test_loader = data_instance.data_test
+all_predictions = []
+all_targets = []
+all_probs = []
 
+classifier.eval() # Set to evaluation mode
+with torch.no_grad():
+    for batch in test_loader:
+        inputs, targets = batch
+        classifier_out = classifier(inputs)
+        # Reshape output if needed (batch, classes)
+        classified = classifier_out.view(classifier_out.shape[0], classifier_out.shape[-1])
+        
+        # Get probabilities for mAP/ROC (LogSoftmax -> Softmax)
+        probs = torch.exp(classified)
+        
+        preds = torch.argmax(classified, dim=1).cpu().numpy()
+        
+        all_predictions.extend(preds)
+        all_targets.extend(targets.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
 
-def main():
-    print(f"Device: {DEVICE}")
-    print(f"Encoded dir: {ENCODED_DIR}")
+predictions = np.array(all_predictions)
+targets = np.array(all_targets)
+probabilities = np.array(all_probs)
 
-    X_train, y_train = load_split('train')
-    X_val,   y_val   = load_split('valid')
-    X_test,  y_test  = load_split('test')
+acc = accuracy_score(targets, predictions)
+recall = recall_score(targets, predictions, average="macro")
+precision = precision_score(targets, predictions, average="macro")
 
-    print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+print("\n--- PERFORMANCE NO CONJUNTO DE TESTE ---")
+print(f"Accuracy: {acc:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"Precision: {precision:.4f}")
 
-    train_ds = TensorDataset(X_train, y_train)
-    val_ds   = TensorDataset(X_val,   y_val)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=256,        shuffle=False)
+# --- OTIMIZAÇÃO DE TESE: MÉTRICAS AVANÇADAS (mAP, PR, ROC) ---
+from sklearn.metrics import precision_recall_curve, average_precision_score, roc_curve, auc
+from sklearn.preprocessing import label_binarize
 
-    model = MLPClassifier(INPUT_DIM, HIDDEN_DIM, NUM_CLASSES).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.CrossEntropyLoss()
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+# Binarizar labels para multiclasse (necessário para mAP e curvas por classe)
+n_classes = len(data_instance.labels_list)
+targets_bin = label_binarize(targets, classes=range(n_classes))
 
-    best_val_acc = 0.0
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
-            logits = model(X_batch)
-            loss = criterion(logits, y_batch)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        scheduler.step()
+# Matrix Labels
+classes_names = []
+base_classes = {1: 'BOAT', 3: 'BUOY', 4: 'LAND', 5: 'SHIP', 6: 'SKY'}
+for label in data_instance.labels_list:
+    classes_names.append(base_classes.get(label, str(label)))
 
-        if epoch % 10 == 0 or epoch == 1:
-            model.eval()
-            correct = 0
-            total   = 0
-            with torch.no_grad():
-                for X_batch, y_batch in val_loader:
-                    X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
-                    preds = model(X_batch).argmax(1)
-                    correct += (preds == y_batch).sum().item()
-                    total   += y_batch.size(0)
-            val_acc = correct / total
-            print(f"  Epoch {epoch:3d}/{EPOCHS}  val_acc={val_acc:.4f}")
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                save_path = os.path.join(MODEL_DIR, "MVELSA_CLASSIFIER.pth")
-                torch.save(model.state_dict(), save_path)
+# 1. Calcular mAP (Mean Average Precision)
+# MVELSA aqui atua como classificador; o mAP é a média das APs de cada classe.
+aps = []
+plt.figure(figsize=(10, 8))
+for i in range(n_classes):
+    ap = average_precision_score(targets_bin[:, i], probabilities[:, i])
+    aps.append(ap)
+    
+    precision_vals, recall_vals, _ = precision_recall_curve(targets_bin[:, i], probabilities[:, i])
+    plt.plot(recall_vals, precision_vals, label=f'{classes_names[i]} (AP={ap:.2f})')
 
-    # Test evaluation
-    model.load_state_dict(torch.load(os.path.join(MODEL_DIR, "MVELSA_CLASSIFIER.pth"),
-                                     map_location=DEVICE))
-    model.eval()
-    test_ds = TensorDataset(X_test, y_test)
-    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
+mAP = np.mean(aps)
+print(f"Mean Average Precision (mAP): {mAP:.4f}")
 
-    correct = 0
-    total   = 0
-    with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
-            preds = model(X_batch).argmax(1)
-            correct += (preds == y_batch).sum().item()
-            total   += y_batch.size(0)
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title(f'Precision-Recall Curve (mAP={mAP:.4f})')
+plt.legend(loc='best')
+plt.grid(True)
+plt.savefig("Cropped_PR_Curve.png")
+print("Saved Cropped_PR_Curve.png")
 
-    test_acc = correct / total
-    print(f"\nBest val acc: {best_val_acc:.4f}")
-    print(f"Test acc:     {test_acc:.4f}")
-    print(f"Model saved to: {MODEL_DIR}/MVELSA_CLASSIFIER.pth")
+# 2. ROC Curve
+plt.figure(figsize=(10, 8))
+for i in range(n_classes):
+    fpr, tpr, _ = roc_curve(targets_bin[:, i], probabilities[:, i])
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f'{classes_names[i]} (AUC={roc_auc:.2f})')
 
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve (Multiclass)')
+plt.legend(loc='best')
+plt.grid(True)
+plt.savefig("Cropped_ROC_Curve.png")
+print("Saved Cropped_ROC_Curve.png")
 
-if __name__ == '__main__':
-    main()
+# 3. Matriz de Confusão NORMALIZADA
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+
+print(f"\nMatrix Labels (in order): {classes_names}")
+
+cm = confusion_matrix(targets, predictions, labels=range(n_classes), normalize='true')
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=classes_names)
+
+fig, ax = plt.subplots(figsize=(12, 12))
+disp.plot(cmap="gray_r", ax=ax, xticks_rotation=45, values_format='.2f')
+
+# OTIMIZAÇÃO DE TESE: Adicionar métricas globais no título do gráfico
+plt.title(f"Confusion Matrix Normalized (All Marine Classes)\n"
+          f"Accuracy: {acc:.4f} | Recall: {recall:.4f} | Precision: {precision:.4f}", 
+          fontsize=14, pad=20)
+
+plt.tight_layout()
+fig.savefig("Cropped_ConfusionMatrix.png")
+print("\nMatriz de Confusão NORMALIZADA (com métricas) salva como Cropped_ConfusionMatrix.png")
+
+# SALVAR MODELO PARA V3 (DETECÇÃO) - OTIMIZADO (Apenas pesos)
+checkpoint = {
+    'state_dict': classifier.state_dict(),
+    'model_parameters': model_parameters,
+    'labels_list': data_instance.labels_list
+}
+torch.save(checkpoint, "MVELSA_CLASSIFIER.pth")
+print("Modelo de classificação (pesos apenas) salvo como MVELSA_CLASSIFIER.pth para uso na v3.")

@@ -1,105 +1,67 @@
-"""
-Generates encoded latent vectors for all images using all MVELSA specialists.
-
-For each image, passes it through all 5 specialist autoencoders and
-concatenates the latent vectors → 5×256=1280D representation.
-
-Output:
-    ENCODED_DATA_CROPPED_SURFACE/
-        train_encoded.pt  — {'features': Tensor[N,1280], 'labels': Tensor[N]}
-        valid_encoded.pt
-        test_encoded.pt
-
-Usage:
-    python gen_cropped_encoded.py
-
-Environment variables:
-    DATA_DIR    — coco_cropped directory
-    MODEL_DIR   — ELSA_MODEL_CROPPED_SURFACE directory
-    ENCODED_DIR — output directory (ENCODED_DATA_CROPPED_SURFACE)
-"""
-
-import os
 import sys
+import os
+sys.path.append("../../../../")
+
 import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from pathlib import Path
+import torchvision.transforms as transforms
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cropped_data_generator import CroppedSurfaceDataset, BASE_CLASSES, CLASS_TO_IDX
-from train_cropped_mvelsa import ConvAutoencoder, LATENT_DIM, FOCUS_CLASSES
+from data.data_preparation import DataPreparation
+from elsanet.mvelsa import MVELSA
+from elsanet.elsa import ELSA
+from cropped_data_generator import CroppedDataset, PadToSquare
 
-BASE_DIR     = Path(__file__).resolve().parent
-DATA_DIR     = os.environ.get("DATA_DIR",     str(BASE_DIR / "../../../../data/coco_cropped"))
-MODEL_DIR    = os.environ.get("MODEL_DIR",    str(BASE_DIR / "ELSA_MODEL_CROPPED_SURFACE"))
-ENCODED_DIR  = os.environ.get("ENCODED_DIR",  str(BASE_DIR / "ENCODED_DATA_CROPPED_SURFACE"))
+x_resolution = 64
+y_resolution = 64
+channels = 3
+resolution = (x_resolution, y_resolution)
 
-DEVICE       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-BATCH_SIZE   = 128
+transform = transforms.Compose([
+    PadToSquare(),                                           # Preserva aspect ratio
+    transforms.ToTensor(),
+    transforms.Resize(size=resolution),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) # CRÍTICO: Deve bater com o treino
+])
 
+dataset_train = CroppedDataset("../../../../data/coco_cropped", train=True, transform=transform)
+dataset_val = CroppedDataset("../../../../data/coco_cropped", train=False, transform=transform)
 
-def load_specialists():
-    specialists = {}
-    for cls_id in sorted(FOCUS_CLASSES):
-        cls_name = BASE_CLASSES[cls_id]
-        model = ConvAutoencoder(latent_dim=LATENT_DIM).to(DEVICE)
-        ckpt = os.path.join(MODEL_DIR, f"ae_{cls_name}.pth")
-        model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
-        model.eval()
-        specialists[cls_name] = model
-        print(f"  Loaded specialist: {cls_name}")
-    return specialists
+train_labels = set(dataset_train.targets)
+val_labels = set(dataset_val.targets)
 
+category_ids = list(train_labels.intersection(val_labels))
+# OTIMIZAÇÃO DE TESE: Expansão para ambiente marinho completo
+# 1 = BOAT, 3 = BUOY, 4 = LAND, 10 = SHIP, 11 = SKY, 12 = WATER
+focus_classes = {1, 3, 4, 5, 6}  # BOAT, BUOY, LAND, SHIP, SKY
+category_ids = [c for c in category_ids if c in focus_classes]
+print(f"Categories to encode (Filtered to Focus Classes): {category_ids}")
+data_parameters = {
+    "data_type": "image",
+    "file_path": "../../../../data/coco_cropped/",
+    "dataset_name": CroppedDataset,
+    "transform": transform,
+    "batch_size": 128,          
+    "data_train_lenght": None,
+    "data_val_lenght": 50,
+}
 
-def encode_split(split, data_dir, specialists):
-    ds = CroppedSurfaceDataset(
-        os.path.join(data_dir, split),
-        focus_classes=FOCUS_CLASSES
-    )
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False,
-                        num_workers=4, pin_memory=True)
+data_instance = DataPreparation(data_parameters).gen()
+data_instance.get_labels(category_ids)
 
-    all_features = []
-    all_labels   = []
+from elsanet.mvelsa import RMSELoss
 
-    with torch.no_grad():
-        for batch in tqdm(loader, desc=f"Encoding {split}"):
-            imgs, labels = batch[0], batch[1]
-            imgs = imgs.to(DEVICE)
+model_file = "ELSA_MODEL_CROPPED_SURFACE"
 
-            # Concatenate latents from all specialists
-            latents = []
-            for cls_name in sorted(specialists.keys()):
-                z = specialists[cls_name].encode(imgs)
-                latents.append(z.cpu())
-            concat = torch.cat(latents, dim=1)  # [B, 5*256]
+print(f"Buscando modelo: {model_file}...")
+try:
+    with torch.serialization.safe_globals([MVELSA, ELSA, RMSELoss]):
+        mvelsa = torch.load(model_file, weights_only=False)
+except AttributeError:
+    # Fallback for older PyTorch versions
+    mvelsa = torch.load(model_file)
 
-            all_features.append(concat)
-            all_labels.append(labels)
+print("Modelo MVELSA carregado. Gerando variavéis latentes para as imagens recortadas...")
+data_instance.mvelsa = mvelsa
+data_instance.gen_encoded_data()
 
-    features = torch.cat(all_features, dim=0)
-    labels   = torch.cat(all_labels,   dim=0)
-
-    print(f"  {split}: {features.shape[0]} samples, {features.shape[1]}D")
-    return {'features': features, 'labels': labels}
-
-
-def main():
-    print(f"Device: {DEVICE}")
-    os.makedirs(ENCODED_DIR, exist_ok=True)
-
-    print("Loading specialists...")
-    specialists = load_specialists()
-
-    for split in ('train', 'valid', 'test'):
-        data = encode_split(split, DATA_DIR, specialists)
-        out_path = os.path.join(ENCODED_DIR, f"{split}_encoded.pt")
-        torch.save(data, out_path)
-        print(f"  Saved: {out_path}")
-
-    print("\nEncoding complete!")
-
-
-if __name__ == '__main__':
-    main()
+data_instance.save(file_name="ENCODED_DATA_CROPPED_SURFACE")
+print("Saved encoded features as ENCODED_DATA_CROPPED_SURFACE")
