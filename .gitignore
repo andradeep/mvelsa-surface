@@ -1,0 +1,27 @@
+# Large binary model files
+experiments/images/coco_surface/v1_full_image/ELSA_MODEL_COCO_SURFACE
+experiments/images/coco_surface/v1_full_image/ENCODED_DATA_COCO_SURFACE
+experiments/images/coco_surface/v2_cropped_optimized/ELSA_MODEL_CROPPED_SURFACE
+experiments/images/coco_surface/v2_cropped_optimized/ENCODED_DATA_CROPPED_SURFACE
+experiments/images/coco_surface/v4_iaug_validation/ELSA_MODEL_IAUG
+experiments/images/coco_surface/v4_iaug_validation/ENCODED_DATA_IAUG
+experiments/images/coral-reef/ELSA_MODEL_ALL_LABELS
+experiments/images/coral-reef/ENCODED_DATA_ALL_LABELS
+
+# Dataset images (large)
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Backup folder
+experiments/images/coco_surface_backup/
+
+# IDE
+.vscode/
+.claude/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
